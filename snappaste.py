@@ -252,6 +252,7 @@ def calculate_rotation(local_neighborhood, local_positions, local_center, corres
     vals, vecs, = np.linalg.eig(matrix)
     rotation_quaternion = vecs[:,np.argmax(vals)]
 
+    # convert quaternion to transformation matrix
     q = rotation_quaternion[:3]
     r = rotation_quaternion[3] * iteration / max_iterations
     Q = np.matrix([
@@ -260,7 +261,9 @@ def calculate_rotation(local_neighborhood, local_positions, local_center, corres
         [-q[1], q[0], 0]
     ])
 
-    R = (r*r - np.inner(q, q)) * np.matlib.eye(3) + 2 * np.outer(q, q) + 2 * r * Q
+    rotation = (r*r - np.inner(q, q)) * np.matlib.eye(3) + 2 * np.outer(q, q) + 2 * r * Q
+    R = np.matlib.eye(4)
+    R[:-1,:-1] = rotation
     return R
 
 def calculate_transforms(from_mesh, distances_to_boundary, snapping_region_size, to_mesh, correspondence_points, iteration, max_iterations, elasticity):
@@ -277,6 +280,7 @@ def calculate_transforms(from_mesh, distances_to_boundary, snapping_region_size,
 
         local_positions = from_mesh.positions
 
+        # assume correspondence point is self if not in correspondence_points
         corresponding_positions = {}
         is_corresponding_same_as_local = True
         for v in local_neighborhood:
@@ -304,7 +308,6 @@ def calculate_transforms(from_mesh, distances_to_boundary, snapping_region_size,
 def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, iteration, iterations, elasticity):
     # find correspondence points for each vertex in each snapping region
     correspondence_points = find_correspondence_points(mesh1, snapping_region1, mesh2, snapping_region2)
-    # assume correspondence point is self if not in correspondence_points
 
     transforms = calculate_transforms(mesh1, distances_to_boundary1, snapping_region_size1, mesh2, correspondence_points, iteration, iterations, elasticity)
 
