@@ -9,6 +9,79 @@ from updateable_priority_queue import UpdateablePriorityQueue
 
 NEIGHBORHOOD_SIZE = 10
 
+class PointCloud():
+    def __init__(self, meshes_and_regions, osculating_circle_angle_subtended):
+        self.osculating_circle_angle_subtended = osculating_circle_angle_subtended
+        self.positions = []
+        self.neighborhoods = {}
+        for mesh, region in meshes_and_regions:
+            for vertex in region:
+                self.positions.append(mesh.positions[vertex])
+
+    def find_neighborhood(self, vertex):
+        if vertex not in self.neighborhoods:
+            pos = self.positions[vertex]
+            squared_dists = [np.dot(pos-other, pos-other) for other in self.positions]
+            # find NEIGHBORHOOD_SIZE closest vertices
+            neighborhood = np.argpartition(squared_dists, NEIGHBORHOOD_SIZE-1)[:NEIGHBORHOOD_SIZE]
+            # get distance of farthest vertex in neighborhood
+            neighborhood_radius = np.sqrt(squared_dists[neighborhood[-1]])
+            self.neighborhoods[vertex] = set(neighborhood), neighborhood_radius
+        return self.neighborhoods[vertex]
+
+    def find_closest_vertex(self, position):
+        closest = (math.inf,)
+        for i, vertex_position in enumerate(self.positions):
+            dist = np.linalg.norm(position - vertex_position)
+            if dist < closest[0]:
+                closest = (dist, i)
+        return closest[1]
+
+    def calculate_principal_curvatures(self, vertex):
+        neighborhood, _ = self.find_neighborhood(vertex)
+        neighborhood_positions = [self.positions[v] for v in neighborhood]
+        coeffs = calculate_polynomial(self.positions[vertex], neighborhood_positions)
+
+        # polynomial is centered at position, i.e. we want the curvature at (x,y) = (0,0)
+        # surface defined by r(x,y) -> (x, y, z(x,y))
+        # where z(x,y) = polynomial(x,y) = coeffs . vars(x,y)
+
+        # calculate partial derivatives of r
+        # vars = [1, x, y, x**2, y**2, x * y, x**3, y**3, x**2 * y, y**2 * x]
+        # vars_sub_x  = coeffs . [0, 1, 0, 2x, 0, y, 3x**2, 0, 2xy, y**2]
+        # vars_sub_y  = coeffs . [0, 0, 1, 0, 2y, x, 0, 3y**2, x**2, 2xy]
+        # vars_sub_xx = coeffs . [0, 0, 0, 2, 0, 0, 6x, 0, 2y, 0]
+        # vars_sub_yy = coeffs . [0, 0, 0, 0, 2, 0, 0, 6y, 0, 2x]
+        # vars_sub_xy = coeffs . [0, 0, 0, 0, 0, 1, 0, 0, 2x, 2y]
+        z_sub_x = np.dot(coeffs, np.array([0, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+        z_sub_y = np.dot(coeffs, np.array([0, 0, 1, 0, 0, 0, 0, 0, 0, 0]))
+        z_sub_xx = np.dot(coeffs, np.array([0, 0, 0, 2, 0, 0, 0, 0, 0, 0]))
+        z_sub_yy = np.dot(coeffs, np.array([0, 0, 0, 0, 2, 0, 0, 0, 0, 0]))
+        z_sub_xy = np.dot(coeffs, np.array([0, 0, 0, 0, 0, 1, 0, 0, 0, 0]))
+        r_sub_x = [1, 0, z_sub_x]
+        r_sub_y = [0, 1, z_sub_y]
+        cross = np.cross(r_sub_x, r_sub_y)
+        normal = cross / np.linalg.norm(cross)
+        # first fundamental form coefficients (dot of first partial derivatives)
+        E = np.dot(r_sub_x, r_sub_x)
+        F = np.dot(r_sub_x, r_sub_y)
+        G = np.dot(r_sub_y, r_sub_y)
+        # second fundamental form coefficients (normal dotted with second partial derivatives)
+        e = normal[2] * z_sub_xx
+        f = normal[2] * z_sub_xy
+        g = normal[2] * z_sub_yy
+
+        shape_operator = np.array([[e*G-f*F, f*G-g*F], [f*E-e*F, g*E-f*F]]) / (E*G-F**2)
+        principal_curvatures = np.linalg.eig(shape_operator)[0]
+        return principal_curvatures
+
+    def guidance_field(self, position):
+        """guidance field for ideal triangle edge length at each position"""
+        closest_vertex = self.find_closest_vertex(position)
+        curvatures = self.calculate_principal_curvatures(closest_vertex)
+        return self.osculating_circle_angle_subtended / max(curvatures)
+
+
 h = 1 # TODO what's a good value for the gaussian curve
 
 def gaussian(dist):
@@ -126,12 +199,12 @@ def field_min_in_sphere(field, center, radius):
 err_allowed = 10
 min_base_angle = (60 - err_allowed) * pi / 180
 max_base_angle = (60 + err_allowed) * pi / 180
-def predict_vertex(edge, field, edge_other_point):
+def predict_vertex(edge, point_cloud, edge_other_point):
     # find a good edge length
     edge_len = np.linalg.norm(edge[0] - edge[1])
     radius = edge_len * sin(2 * min_base_angle) / sin(3 * min_base_angle)
     midpoint = (edge[0] + edge[1]) / 2
-    ideal_length = field_min_in_sphere(field, midpoint, radius)
+    ideal_length = field_min_in_sphere(point_cloud.guidance_field, midpoint, radius)
     base_angle = acos(edge_len/2 / ideal_length)
     if base_angle < min_base_angle:
         base_angle = min_base_angle
@@ -174,37 +247,37 @@ def find_cut_vertex(edge, mesh, prev_vertex):
             return dest
     return None
 
-def add_edge_to_boundaries(boundaries, edge, other_vertex, mesh, field):
+def add_edge_to_boundaries(boundaries, edge, other_vertex, mesh, point_cloud):
     cut_vertex = find_cut_vertex(edge, mesh, other_vertex)
     if cut_vertex is not None:
         next_vertex = cut_vertex
         priority = 0 # TODO should we always do cuts first?
     else:
         edge_positions = [mesh.positions[edge[0]], mesh.positions[edge[1]]]
-        next_vertex, priority = predict_vertex(edge_positions, field, mesh.positions[other_vertex])
+        next_vertex, priority = predict_vertex(edge_positions, point_cloud, mesh.positions[other_vertex])
     boundaries.push(edge, (False, priority, next_vertex))
 
-def add_edge_to_boundaries_(boundaries, edge, other_vertex_position, mesh, field):
+def add_edge_to_boundaries_(boundaries, edge, other_vertex_position, mesh, point_cloud):
     edge_positions = [mesh.positions[edge[0]], mesh.positions[edge[1]]]
-    next_vertex, priority = predict_vertex(edge_positions, field, other_vertex_position)
+    next_vertex, priority = predict_vertex(edge_positions, point_cloud, other_vertex_position)
     boundaries.push(edge, (False, priority, next_vertex))
 
-def grow_triangle(mesh, edge, vertex, boundaries, field):
+def grow_triangle(mesh, edge, vertex, boundaries, point_cloud):
     vertex_index = len(mesh.positions)
     mesh.positions.append(vertex)
-    connect_triangle(mesh, edge, vertex_index, boundaries, field)
+    connect_triangle(mesh, edge, vertex_index, boundaries, point_cloud)
 
-def connect_triangle(mesh, edge, vertex_index, boundaries, field):
+def connect_triangle(mesh, edge, vertex_index, boundaries, point_cloud):
     mesh.faces.append([*edge, vertex_index])
 
     mesh.adjacency_list[vertex_index] = set(edge)
     mesh.adjacency_list[edge[0]].add(vertex_index)
     mesh.adjacency_list[edge[1]].add(vertex_index)
 
-    add_edge_to_boundaries(boundaries, Edge(edge[0], vertex_index), edge[1], mesh, field)
-    add_edge_to_boundaries(boundaries, Edge(edge[1], vertex_index), edge[0], mesh, field)
+    add_edge_to_boundaries(boundaries, Edge(edge[0], vertex_index), edge[1], mesh, point_cloud)
+    add_edge_to_boundaries(boundaries, Edge(edge[1], vertex_index), edge[0], mesh, point_cloud)
 
-def cut_ear(mesh, edge, vertex_index, boundaries, field):
+def cut_ear(mesh, edge, vertex_index, boundaries, point_cloud):
     mesh.faces.append([*edge, vertex_index])
 
     vertex_adjacencies = mesh.adjacency_list[vertex_index]
@@ -217,9 +290,9 @@ def cut_ear(mesh, edge, vertex_index, boundaries, field):
         vertex_adjacencies.add(v)
         mesh.adjacency_list[v].add(vertex_index)
 
-        add_edge_to_boundaries(boundaries, Edge(v, vertex_index), edge[(i+1)%2], mesh, field)
+        add_edge_to_boundaries(boundaries, Edge(v, vertex_index), edge[(i+1)%2], mesh, point_cloud)
 
-def add_snapping_region_boundary(boundaries, new_mesh, mesh, snapping_region, field):
+def add_snapping_region_boundary(boundaries, new_mesh, mesh, snapping_region, point_cloud):
     boundary_vertices = set()
     for vertex in snapping_region:
         for next_vertex in mesh.adjacency_list[vertex]:
@@ -256,57 +329,7 @@ def add_snapping_region_boundary(boundaries, new_mesh, mesh, snapping_region, fi
             new_mesh.adjacency_list[v2].add(v1)
 
             # add edge to boundaries queue
-            add_edge_to_boundaries_(boundaries, Edge(v1, v2), mesh.positions[vertex], new_mesh, field)
-
-def calculate_principal_curvatures(position, mesh1, mesh2, snapping_region1, snapping_region2):
-    coeffs = calculate_polynomial(position, neighborhood)
-
-    # polynomial is centered at position, i.e. we want the curvature at (x,y) = (0,0)
-    # surface defined by r(x,y) -> (x, y, z(x,y))
-    # where z(x,y) = polynomial(x,y) = coeffs . vars(x,y)
-
-    # calculate partial derivatives of r
-    # vars = [1, x, y, x**2, y**2, x * y, x**3, y**3, x**2 * y, y**2 * x]
-    # vars_sub_x  = coeffs . [0, 1, 0, 2x, 0, y, 3x**2, 0, 2xy, y**2]
-    # vars_sub_y  = coeffs . [0, 0, 1, 0, 2y, x, 0, 3y**2, x**2, 2xy]
-    # vars_sub_xx = coeffs . [0, 0, 0, 2, 0, 0, 6x, 0, 2y, 0]
-    # vars_sub_yy = coeffs . [0, 0, 0, 0, 2, 0, 0, 6y, 0, 2x]
-    # vars_sub_xy = coeffs . [0, 0, 0, 0, 0, 1, 0, 0, 2x, 2y]
-    z_sub_x = np.dot(coeffs, np.array([0, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
-    z_sub_y = np.dot(coeffs, np.array([0, 0, 1, 0, 0, 0, 0, 0, 0, 0]))
-    z_sub_xx = np.dot(coeffs, np.array([0, 0, 0, 2, 0, 0, 0, 0, 0, 0]))
-    z_sub_yy = np.dot(coeffs, np.array([0, 0, 0, 0, 2, 0, 0, 0, 0, 0]))
-    z_sub_xy = np.dot(coeffs, np.array([0, 0, 0, 0, 0, 1, 0, 0, 0, 0]))
-    r_sub_x = [1, 0, z_sub_x]
-    r_sub_y = [0, 1, z_sub_y]
-    cross = np.cross(r_sub_x, r_sub_y)
-    normal = cross / np.linalg.norm(cross)
-    # first fundamental form coefficients (dot of first partial derivatives)
-    E = np.dot(r_sub_x, r_sub_x)
-    F = np.dot(r_sub_x, r_sub_y)
-    G = np.dot(r_sub_y, r_sub_y)
-    # second fundamental form coefficients (normal dotted with second partial derivatives)
-    e = normal[2] * z_sub_xx
-    f = normal[2] * z_sub_xy
-    g = normal[2] * z_sub_yy
-
-    shape_operator = np.array([[e*G-f*F, f*G-g*F], [f*E-e*F, g*E-f*F]]) / (E*G-F**2)
-    principal_curvatures = np.linalg.eig(shape_operator)[0]
-    return principal_curvatures
-
-def find_closest_vertex(position, mesh1, mesh2, snapping_region1, snapping_region2):
-    closest = (math.inf,)
-    for vertex in snapping_region1:
-        vertex_position = mesh1.positions[vertex]
-        dist = np.linalg.norm(position - vertex_position)
-        if dist < closest[0]:
-            closest = (dist, vertex_position)
-    for vertex in snapping_region2:
-        vertex_position = mesh2.positions[vertex]
-        dist = np.linalg.norm(position - vertex_position)
-        if dist < closest[0]:
-            closest = (dist, vertex_position)
-    return closest[1]
+            add_edge_to_boundaries_(boundaries, Edge(v1, v2), mesh.positions[vertex], new_mesh, point_cloud)
 
 def find_closest_boundary(vertex, boundaries, mesh):
     vertex_position = mesh.positions[vertex]
@@ -330,17 +353,14 @@ def find_closest_boundary(vertex, boundaries, mesh):
             closest = (distance, edge)
     return closest
 
-def remesh(mesh1, mesh2, boundary_loop1, boundary_loop2, snapping_region1, snapping_region2, osculating_circle_angle_subtended=pi/4):
-    def field(position):
-        """guidance field for ideal triangle edge length at each position"""
-        closest_vertex = find_closest_vertex(position, mesh1, mesh2, snapping_region1, snapping_region2)
-        curvatures = calculate_principal_curvatures(closest_vertex, mesh1, mesh2, snapping_region1, snapping_region2)
-        return osculating_circle_angle_subtended / max(curvatures)
+def remesh(mesh1, mesh2, snapping_region1, snapping_region2, osculating_circle_angle_subtended=pi/4):
+    point_cloud = PointCloud([(mesh1, snapping_region1), (mesh2, snapping_region2)], osculating_circle_angle_subtended)
+
     boundaries = UpdateablePriorityQueue()
     new_mesh = Mesh()
     # initialize new_mesh and boundaries with snapping regions' boundaries
-    add_snapping_region_boundary(boundaries, new_mesh, mesh1, snapping_region1, field)
-    add_snapping_region_boundary(boundaries, new_mesh, mesh2, snapping_region2, field)
+    add_snapping_region_boundary(boundaries, new_mesh, mesh1, snapping_region1, point_cloud)
+    add_snapping_region_boundary(boundaries, new_mesh, mesh2, snapping_region2, point_cloud)
 
     while boundaries:
         edge, (is_deferred, priority, vertex) = boundaries.pop()
@@ -348,19 +368,19 @@ def remesh(mesh1, mesh2, boundary_loop1, boundary_loop2, snapping_region1, snapp
         #    cut
         if priority < 1:
             # priority < 0 only set for cuts
-            cut_ear(new_mesh, edge, vertex, boundaries, field)
+            cut_ear(new_mesh, edge, vertex, boundaries, point_cloud)
             continue
         # vertex = predict_vertex(edge, field, other_vertex)
 
         closest_dist, closest_edge = find_closest_boundary(vertex, boundaries, new_mesh)
-        if closest_dist < field(vertex) / 2:
+        if closest_dist < point_cloud.guidance_field(vertex) / 2:
             if is_deferred:
                 # create triangle with closest vertex of closest_edge
                 edge1_length = np.linalg.norm(new_mesh.positions[closest_edge[0]] - vertex)
                 edge2_length = np.linalg.norm(new_mesh.positions[closest_edge[1]] - vertex)
 
                 vertex_index = closest_edge[0] if edge1_length < edge2_length else closest_edge[1]
-                connect_triangle(new_mesh, edge, vertex_index, boundaries, field)
+                connect_triangle(new_mesh, edge, vertex_index, boundaries, point_cloud)
                 # if vertex closer to edge endpoints than closest_edge endpoints:
                 #     split closest_edge
                 # else:
@@ -368,4 +388,4 @@ def remesh(mesh1, mesh2, boundary_loop1, boundary_loop2, snapping_region1, snapp
             else:
                 boundaries.push(new_mesh, (True, priority, vertex))
         else:
-            grow_triangle(new_mesh, edge, vertex, boundaries, field)
+            grow_triangle(new_mesh, edge, vertex, boundaries, point_cloud)
