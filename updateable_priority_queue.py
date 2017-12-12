@@ -57,6 +57,9 @@ class UpdateablePriorityQueue():
     def __setitem__(self, key, priority):
         self.push(key, priority)
 
+    def __iter__(self):
+        return iter(self._dict)
+
     def push(self, key, priority):
         self._dict[key] = priority
         heappush(self._heap, (priority, key))
