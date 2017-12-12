@@ -2,7 +2,6 @@
 use snappaste algorithm to merge two meshes
 https://www.cs.tau.ac.il/~dcor/articles/2006/SnapPaste.pdf
 """
-import IPython
 import argparse
 import math
 from collections import Counter
@@ -16,19 +15,26 @@ from updateable_priority_queue import UpdateablePriorityQueue
 
 
 class Mesh:
-    def __init__(self, plydata):
-        vertices = plydata["vertex"].data.view((np.float32, 3))
-        # vertices = plydata["vertex"].data.view((np.float32, 6))
-        self.positions = vertices[:, :3]
-        # self.normals = vertices[:, 3:]
-        self.normals = np.zeros_like(self.positions)
+    def __init__(self, plydata=None):
+        if plydata is None:
+            self.positions = [] # positions/normals NOT np arrays here
+            self.normals = []
+            self.faces = []
+            self.adjacency_list = {}
+            self.edge_lengths = {}
+        else:
+            vertices = plydata["vertex"].data.view((np.float32, 3))
+            # vertices = plydata["vertex"].data.view((np.float32, 6))
+            self.positions = vertices[:, :3]
+            # self.normals = vertices[:, 3:]
+            self.normals = np.zeros_like(self.positions)
 
-        # numpyIntArray3[], each face assumed to have 3 verts
-        self.faces = [face for (face,) in plydata["face"].data]
+            # each face assumed to have 3 verts
+            self.faces = [face for (face,) in plydata["face"].data]
 
-        self.adjacency_list = self._create_adjacency_list()
+            self.adjacency_list = self._create_adjacency_list()
 
-        self.edge_lengths = {}
+            self.edge_lengths = {}
 
     def _create_adjacency_list(self):
         adj = {}
@@ -54,7 +60,7 @@ class Mesh:
             self.edge_lengths[edge] = np.linalg.norm(v1 - v2)
         return self.edge_lengths[edge]
 
-    def find_boundary_loop(self):
+    def find_boundary_vertices(self):
         """assumes there is only one boundary loop"""
         edges = Counter()
         for face in self.faces:
@@ -63,12 +69,13 @@ class Mesh:
                 edge = Edge(vertex, prev)
                 edges[edge] += 1
                 prev = vertex
-        loop = set()
+
+        vertices = set()
         for (edge, count) in edges.items():
             if count == 1:
-                loop.add(edge[0])
-                loop.add(edge[1])
-        return loop
+                vertices.add(edge[0])
+                vertices.add(edge[1])
+        return vertices
 
 class Edge(tuple):
     def __new__(self, vertex1, vertex2):
@@ -352,42 +359,6 @@ def calculate_transforms(from_mesh, distances_to_boundary, snapping_region_size,
         transforms[vertex] = T2 * R * S * T1
     return transforms
 
-# def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, iteration, iterations, elasticity):
-#     # find correspondence points for each vertex in each snapping region
-#     correspondence_points = find_correspondence_points(mesh1, snapping_region1, mesh2, snapping_region2)
-#
-#     # transformation for each vertex in mesh. Everything that had distnace inf should have identity matrix
-#     transforms = calculate_transforms(mesh1, distances_to_boundary1, snapping_region_size1, mesh2, correspondence_points, iteration, iterations, elasticity)
-#
-#     for vertex in range(len(mesh1.positions)):
-#         # apply transform
-#         pos = np.append(mesh1.positions[vertex], 1)
-#         mesh1.positions[vertex] = np.dot(transforms[vertex], pos)[0,:-1]
-
-def merge(mesh1, mesh2, iterations, elasticity):
-    # find unordered boundary loops, and the vertices on the other mesh closest to them
-    loop1 = mesh1.find_boundary_loop()
-    closest_vertices_to_loop1_in_mesh2 = get_closest_vertices_in_other_mesh(mesh1, loop1, mesh2)
-
-    loop2 = mesh2.find_boundary_loop()
-    closest_vertices_to_loop2_in_mesh1 = get_closest_vertices_in_other_mesh(mesh2, loop2, mesh1)
-
-    # find snapping region: compute geodesic distance of each point to boundary loop
-    snapping_region1, snapping_region_size1, distances_to_boundary1 =\
-            find_snapping_region(mesh1, loop1, closest_vertices_to_loop2_in_mesh1)
-    snapping_region2, snapping_region_size2, distances_to_boundary2 =\
-            find_snapping_region(mesh2, loop2, closest_vertices_to_loop1_in_mesh2)
-    #TODO should probably stop if snapping region is too big or small
-
-    for i in range(1, iterations + 1):
-        print("Enter iteration", i)
-        if i % 2 == 0:
-            run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, i, iterations, elasticity)
-        else:
-            run_merge_iteration(mesh2, snapping_region2, snapping_region_size2, distances_to_boundary2, mesh1, snapping_region1, i, iterations, elasticity)
-
-        # TODO retriangulate
-
 def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2,
                         snapping_region2, iteration, iterations, elasticity):
     # find correspondence points for each vertex in each snapping region
@@ -401,6 +372,30 @@ def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distance
         # apply transform
         pos = np.append(mesh1.positions[vertex], 1)
         mesh1.positions[vertex] = np.dot(transforms[vertex], pos)[0, :-1]
+
+def merge(mesh1, mesh2, iterations, elasticity):
+    # find unordered boundary loops, and the vertices on the other mesh closest to them
+    boundary_vertices1 = mesh1.find_boundary_vertices()
+    closest_vertices_to_loop1_in_mesh2 = get_closest_vertices_in_other_mesh(mesh1, boundary_vertices1, mesh2)
+
+    boundary_vertices2 = mesh2.find_boundary_vertices()
+    closest_vertices_to_loop2_in_mesh1 = get_closest_vertices_in_other_mesh(mesh2, boundary_vertices2, mesh1)
+
+    # find snapping region: compute geodesic distance of each point to boundary loop
+    snapping_region1, snapping_region_size1, distances_to_boundary1 =\
+            find_snapping_region(mesh1, boundary_vertices1, closest_vertices_to_loop2_in_mesh1)
+    snapping_region2, snapping_region_size2, distances_to_boundary2 =\
+            find_snapping_region(mesh2, boundary_vertices2, closest_vertices_to_loop1_in_mesh2)
+    #TODO should probably stop if snapping region is too big or small
+
+    for i in range(1, iterations + 1):
+        print("Enter iteration", i)
+        if i % 2 == 0:
+            run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, i, iterations, elasticity)
+        else:
+            run_merge_iteration(mesh2, snapping_region2, snapping_region_size2, distances_to_boundary2, mesh1, snapping_region1, i, iterations, elasticity)
+
+        # TODO retriangulate
 
     #raise NotImplementedError()
 
