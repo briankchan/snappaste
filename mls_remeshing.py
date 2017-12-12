@@ -1,5 +1,5 @@
 import math
-from math import acos, cos, pi, sin, tan
+from math import acos, pi, sin, tan
 
 import numpy as np
 import scipy.optimize
@@ -10,7 +10,8 @@ from updateable_priority_queue import UpdateablePriorityQueue
 NEIGHBORHOOD_SIZE = 10
 
 class PointCloud():
-    def __init__(self, meshes_and_regions, osculating_circle_angle_subtended):
+    def __init__(self, meshes_and_regions, smoothing_factor, osculating_circle_angle_subtended):
+        self.smoothing_factor = smoothing_factor
         self.osculating_circle_angle_subtended = osculating_circle_angle_subtended
         self.positions = []
         self.neighborhoods = {}
@@ -37,6 +38,25 @@ class PointCloud():
             self.neighborhoods[vertex] = output
         return output
 
+    def find_neighborhood_and_smoothing(self, vertex):
+        neighborhood, _ = self.find_neighborhood(vertex)
+        position = self.positions[vertex] if isinstance(vertex, int) else vertex
+        distances = []
+        radii = []
+        for v in neighborhood:
+            distances.append(np.linalg.norm(position - self.positions[v]))
+            radii.append(self.find_neighborhood(v)[1])
+        # offset distances so we don't divide by 0
+        distance_offset = sum(distances) / 10
+        smoothing = weights = 0
+        for d,r in zip(distances, radii):
+            weight = 1 / (d + distance_offset)
+            smoothing += r * weight
+            weights += weight
+        smoothing *= self.smoothing_factor / weights
+        neighborhood_positions = [self.positions[v] for v in neighborhood]
+        return neighborhood_positions, smoothing
+
     def find_closest_vertex(self, position):
         closest = (math.inf,)
         for i, vertex_position in enumerate(self.positions):
@@ -46,9 +66,8 @@ class PointCloud():
         return closest[1]
 
     def calculate_principal_curvatures(self, vertex):
-        neighborhood, _ = self.find_neighborhood(vertex)
-        neighborhood_positions = [self.positions[v] for v in neighborhood]
-        coeffs = calculate_polynomial(self.positions[vertex], neighborhood_positions)
+        neighborhood, smoothing = self.find_neighborhood_and_smoothing(vertex)
+        coeffs = calculate_polynomial(self.positions[vertex], neighborhood, smoothing)
 
         # polynomial is centered at position, i.e. we want the curvature at (x,y) = (0,0)
         # surface defined by r(x,y) -> (x, y, z(x,y))
@@ -90,19 +109,17 @@ class PointCloud():
         return self.osculating_circle_angle_subtended / max(curvatures)
 
 
-h = 1 # TODO what's a good value for the gaussian curve
-
-def gaussian(dist):
+def gaussian(dist, h):
     return np.exp(dist**2 / h**2)
 
-def calculate_projection_plane(point, neighborhood):
+def calculate_projection_plane(point, neighborhood, smoothing):
     def f(xs):
         t = xs[0]
         n = np.array(xs[1:])
         output = weights = 0
         for p in neighborhood:
             error = p - point - t * n
-            weight = gaussian(np.linalg.norm(error))
+            weight = gaussian(np.linalg.norm(error), smoothing)
             output += np.dot(n, error)**2 * weight
             weights += weight
         return output / weights
@@ -149,7 +166,7 @@ def cubic_vals(p):
                      x**2 * y,
                      y**2])
 
-def calculate_polynomial_from_plane(point, neighborhood, n, t):
+def calculate_polynomial_from_plane(point, neighborhood, n, t, smoothing):
     plane_center = point + t*n
     ax1 = np.cross(n, n+1)
     ax1 /= np.linalg.norm(ax1)
@@ -177,22 +194,22 @@ def calculate_polynomial_from_plane(point, neighborhood, n, t):
         proj_p = np.array([proj_p1, proj_p2])
 
         values = cubic_vals(proj_p)
-        weight = gaussian(np.linalg.norm(p - plane_center))
+        weight = gaussian(np.linalg.norm(p - plane_center), smoothing)
         mat += weight * np.outer(values, values)
         rhs += values * dist_to_plane
     return scipy.linalg.solve(mat, rhs)
 
-def calculate_polynomial(point, neighborhood):
+def calculate_polynomial(point, neighborhood, smoothing):
     """requires neighborhood of at least 3 points"""
-    t, *n = calculate_projection_plane(point, neighborhood)
+    t, *n = calculate_projection_plane(point, neighborhood, smoothing)
     n = np.array(n)
-    return calculate_polynomial_from_plane(point, neighborhood, n, t)
+    return calculate_polynomial_from_plane(point, neighborhood, n, t, smoothing)
 
-def project_point(point, neighborhood):
+def project_point(point, neighborhood, smoothing):
     """requires neighborhood of at least 3 points"""
-    t, *n = calculate_projection_plane(point, neighborhood)
+    t, *n = calculate_projection_plane(point, neighborhood, smoothing)
     n = np.array(n)
-    coeffs = calculate_polynomial_from_plane(point, neighborhood, n, t)
+    coeffs = calculate_polynomial_from_plane(point, neighborhood, n, t, smoothing)
     return point + t*n + coeffs[0]
 
 
@@ -234,9 +251,8 @@ def predict_vertex(edge, point_cloud, edge_other_point):
     point = midpoint + normal * height
 
     # project point onto MLS surface
-    neighborhood, _ = point_cloud.find_neighborhood(point)
-    neighborhood_positions = [point_cloud.positions[v] for v in neighborhood]
-    projected_point = project_point(point, neighborhood_positions)
+    neighborhood, smoothing = point_cloud.find_neighborhood_and_smoothing(point)
+    projected_point = project_point(point, neighborhood, smoothing)
 
     # calculate priority: ratio of ideal edge length to actual 
     avg_actual_length = sum(np.linalg.norm(projected_point - e) for e in edge) / 2
@@ -370,8 +386,8 @@ def find_closest_boundary(vertex, boundaries, mesh):
             closest = (distance, edge)
     return closest
 
-def remesh(mesh1, mesh2, snapping_region1, snapping_region2, osculating_circle_angle_subtended=pi/4):
-    point_cloud = PointCloud([(mesh1, snapping_region1), (mesh2, snapping_region2)], osculating_circle_angle_subtended)
+def remesh(mesh1, mesh2, snapping_region1, snapping_region2, smoothing_factor=1, osculating_circle_angle_subtended=pi/4):
+    point_cloud = PointCloud([(mesh1, snapping_region1), (mesh2, snapping_region2)], smoothing_factor, osculating_circle_angle_subtended)
 
     boundaries = UpdateablePriorityQueue()
     new_mesh = Mesh()
