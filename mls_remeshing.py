@@ -19,15 +19,23 @@ class PointCloud():
                 self.positions.append(mesh.positions[vertex])
 
     def find_neighborhood(self, vertex):
-        if vertex not in self.neighborhoods:
+        """vertex can be an index from positions, or a position itself (i.e. numpy array)"""
+        if isinstance(vertex, int):
+            if vertex in self.neighborhoods:
+                return self.neighborhoods[vertex]
             pos = self.positions[vertex]
-            squared_dists = [np.dot(pos-other, pos-other) for other in self.positions]
-            # find NEIGHBORHOOD_SIZE closest vertices
-            neighborhood = np.argpartition(squared_dists, NEIGHBORHOOD_SIZE-1)[:NEIGHBORHOOD_SIZE]
-            # get distance of farthest vertex in neighborhood
-            neighborhood_radius = np.sqrt(squared_dists[neighborhood[-1]])
-            self.neighborhoods[vertex] = set(neighborhood), neighborhood_radius
-        return self.neighborhoods[vertex]
+        else:
+            pos = vertex
+
+        squared_dists = [np.dot(pos-other, pos-other) for other in self.positions]
+        # find NEIGHBORHOOD_SIZE closest vertices
+        neighborhood = np.argpartition(squared_dists, NEIGHBORHOOD_SIZE-1)[:NEIGHBORHOOD_SIZE]
+        # get distance of farthest vertex in neighborhood
+        neighborhood_radius = np.sqrt(squared_dists[neighborhood[-1]])
+        output = set(neighborhood), neighborhood_radius
+        if isinstance(vertex, int):
+            self.neighborhoods[vertex] = output
+        return output
 
     def find_closest_vertex(self, position):
         closest = (math.inf,)
@@ -115,18 +123,18 @@ def calculate_projection_plane(point, neighborhood):
 
     return scipy.optimize.minimize(f, [0, *n], method="Powell").x
 
-def cubic(coefficients, p):
-    x,y = p
-    return coefficients[0] +\
-           coefficients[1] * x +\
-           coefficients[2] * y +\
-           coefficients[3] * x**2 +\
-           coefficients[4] * y**2 +\
-           coefficients[5] * x * y +\
-           coefficients[6] * x**3 +\
-           coefficients[8] * y**3 +\
-           coefficients[7] * x**2 * y +\
-           coefficients[9] * y**2 * x
+# def cubic(coefficients, p):
+#     x,y = p
+#     return coefficients[0] +\
+#            coefficients[1] * x +\
+#            coefficients[2] * y +\
+#            coefficients[3] * x**2 +\
+#            coefficients[4] * y**2 +\
+#            coefficients[5] * x * y +\
+#            coefficients[6] * x**3 +\
+#            coefficients[8] * y**3 +\
+#            coefficients[7] * x**2 * y +\
+#            coefficients[9] * y**2 * x
 
 def cubic_vals(p):
     x,y = p
@@ -200,17 +208,21 @@ err_allowed = 10
 min_base_angle = (60 - err_allowed) * pi / 180
 max_base_angle = (60 + err_allowed) * pi / 180
 def predict_vertex(edge, point_cloud, edge_other_point):
-    # find a good edge length
+    """
+    edge_other_point is the other point of the existing triangle that edge is in
+    (needed to calculate direction of new vertex)
+    """
+    # calculate the ideal edge length
     edge_len = np.linalg.norm(edge[0] - edge[1])
     radius = edge_len * sin(2 * min_base_angle) / sin(3 * min_base_angle)
     midpoint = (edge[0] + edge[1]) / 2
     ideal_length = field_min_in_sphere(point_cloud.guidance_field, midpoint, radius)
-    base_angle = acos(edge_len/2 / ideal_length)
-    if base_angle < min_base_angle:
-        base_angle = min_base_angle
-    elif base_angle > max_base_angle:
-        base_angle = max_base_angle
 
+    # clamp to acceptable base angle
+    base_angle = acos(edge_len/2 / ideal_length)
+    base_angle = np.clip(base_angle, min_base_angle, max_base_angle)
+
+    # calculate height of triangle with clamped base angle
     height = tan(base_angle) * edge_len / 2
 
     # calculate direction of new vertex (in plane of prev edge's triangle)
@@ -221,7 +233,12 @@ def predict_vertex(edge, point_cloud, edge_other_point):
 
     point = midpoint + normal * height
 
-    projected_point = project_point(point, neighborhood)
+    # project point onto MLS surface
+    neighborhood, _ = point_cloud.find_neighborhood(point)
+    neighborhood_positions = [point_cloud.positions[v] for v in neighborhood]
+    projected_point = project_point(point, neighborhood_positions)
+
+    # calculate priority: ratio of ideal edge length to actual 
     avg_actual_length = sum(np.linalg.norm(projected_point - e) for e in edge) / 2
     # priority always >= 1; lower priority is better
     priority = ideal_length / avg_actual_length if ideal_length > avg_actual_length\
