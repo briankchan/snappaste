@@ -47,6 +47,9 @@ class Mesh:
                         adj[v1].add(v2)
         return adj
 
+    def reset_edge_lengths(self):
+        self.edge_lengths = {}
+
     def get_vertex_distance(self, vertex1, vertex2=None):
         """pass in 2 adjacent vertices, or an edge"""
         if vertex2 is None:
@@ -372,6 +375,7 @@ def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distance
         # apply transform
         pos = np.append(mesh1.positions[vertex], 1)
         mesh1.positions[vertex] = np.dot(transforms[vertex], pos)[0, :-1]
+    mesh1.reset_edge_lengths()
 
 def merge(mesh1, mesh2, iterations, elasticity):
     # find unordered boundary loops, and the vertices on the other mesh closest to them
