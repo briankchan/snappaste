@@ -12,77 +12,10 @@ import trimesh
 from trimesh import Trimesh
 
 from updateable_priority_queue import UpdateablePriorityQueue
+from mls_remeshing import remesh
+from mesh import Mesh, Edge, Triangle
 
 
-class Mesh:
-    def __init__(self, plydata=None):
-        if plydata is None:
-            self.positions = [] # positions/normals NOT np arrays here
-            self.normals = []
-            self.faces = []
-            self.adjacency_list = {}
-            self.edge_lengths = {}
-        else:
-            vertices = plydata["vertex"].data.view((np.float32, 3))
-            # vertices = plydata["vertex"].data.view((np.float32, 6))
-            self.positions = vertices[:, :3]
-            # self.normals = vertices[:, 3:]
-            self.normals = np.zeros_like(self.positions)
-
-            # each face assumed to have 3 verts
-            self.faces = [face for (face,) in plydata["face"].data]
-
-            self.adjacency_list = self._create_adjacency_list()
-
-            self.edge_lengths = {}
-
-    def _create_adjacency_list(self):
-        adj = {}
-        for face in self.faces:
-            for v1 in face:
-                if v1 not in adj:
-                    adj[v1] = set()
-                for v2 in face:
-                    if v2 != v1:
-                        adj[v1].add(v2)
-        return adj
-
-    def reset_edge_lengths(self):
-        self.edge_lengths = {}
-
-    def get_vertex_distance(self, vertex1, vertex2=None):
-        """pass in 2 adjacent vertices, or an edge"""
-        if vertex2 is None:
-            edge = vertex1
-        else:
-            edge = Edge(vertex1, vertex2)
-
-        if edge not in self.edge_lengths:
-            v1 = self.positions[edge[0]]
-            v2 = self.positions[edge[1]]
-            self.edge_lengths[edge] = np.linalg.norm(v1 - v2)
-        return self.edge_lengths[edge]
-
-    def find_boundary_vertices(self):
-        """assumes there is only one boundary loop"""
-        edges = Counter()
-        for face in self.faces:
-            prev = face[len(face)-1]
-            for vertex in face:
-                edge = Edge(vertex, prev)
-                edges[edge] += 1
-                prev = vertex
-
-        vertices = set()
-        for (edge, count) in edges.items():
-            if count == 1:
-                vertices.add(edge[0])
-                vertices.add(edge[1])
-        return vertices
-
-class Edge(tuple):
-    def __new__(self, vertex1, vertex2):
-        return tuple.__new__(self, (min(vertex1, vertex2), max(vertex1, vertex2)))
 
 def get_closest_vertices_in_other_mesh(mesh1, vertices, mesh2):
     output = set()
@@ -261,7 +194,6 @@ def calculate_rotation(local_neighborhood, local_positions, local_center, corres
     # for vertex in local_neighborhood:
     #     loc_pos = local_positions[vertex]
     #     cor_pos = corresponding_positions[vertex]
-    #     # TODO: does this need to be scaled?
     #     matrix += np.outer(loc_pos - local_center, cor_pos - corresponding_center)
     # u, s, v = np.linalg.svd(matrix)
     # rotation_matrix = np.dot(v, u.T)
@@ -275,7 +207,6 @@ def calculate_rotation(local_neighborhood, local_positions, local_center, corres
     for vertex in local_neighborhood:
         loc_pos = local_positions[vertex] - local_center
         cor_pos = corresponding_positions[vertex] - corresponding_center
-        # TODO: does this need to be scaled?
         # find matrix that we need to find the eigenvectors of to find the quaternions
         loc_mat = np.array([
             [0, loc_pos[0], loc_pos[1], loc_pos[2]],
@@ -376,8 +307,11 @@ def run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distance
         pos = np.append(mesh1.positions[vertex], 1)
         mesh1.positions[vertex] = np.dot(transforms[vertex], pos)[0, :-1]
     mesh1.reset_edge_lengths()
+    mesh1.update_normals()
 
-def merge(mesh1, mesh2, iterations, elasticity):
+    return correspondence_points
+
+def merge(mesh1, mesh2, iterations, elasticity, smoothing_factor):
     # find unordered boundary loops, and the vertices on the other mesh closest to them
     boundary_vertices1 = mesh1.find_boundary_vertices()
     closest_vertices_to_loop1_in_mesh2 = get_closest_vertices_in_other_mesh(mesh1, boundary_vertices1, mesh2)
@@ -394,17 +328,64 @@ def merge(mesh1, mesh2, iterations, elasticity):
 
     for i in range(1, iterations + 1):
         print("Enter iteration", i)
-        if i % 2 == 0:
-            run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, i, iterations, elasticity)
+        if i % 2 == 1:
+            correspondence_points = run_merge_iteration(mesh1, snapping_region1, snapping_region_size1, distances_to_boundary1, mesh2, snapping_region2, i, iterations, elasticity)
         else:
-            run_merge_iteration(mesh2, snapping_region2, snapping_region_size2, distances_to_boundary2, mesh1, snapping_region1, i, iterations, elasticity)
+            correspondence_points = run_merge_iteration(mesh2, snapping_region2, snapping_region_size2, distances_to_boundary2, mesh1, snapping_region1, i, iterations, elasticity)
 
-        # TODO retriangulate
+    # output = remesh(mesh1, mesh2, snapping_region1, snapping_region2, smoothing_factor=smoothing_factor, osculating_circle_angle_subtended=math.pi/8)
+    if iterations % 2 == 0:
+        output = merge_mesh(mesh1, mesh2, correspondence_points, snapping_region2)
+    else:
+        output = merge_mesh(mesh2, mesh1, correspondence_points, snapping_region1)
 
-    #raise NotImplementedError()
+    return output
 
-def save_mesh(mesh, filename):
-    lists = [tuple(i) for i in mesh.positions.tolist()]
+def merge_mesh(base_mesh, extended_mesh, extended_snapping_correspondences, extended_snapping_region):
+    new_mesh = Mesh()
+    new_mesh.positions = base_mesh.positions.tolist()
+    new_mesh.faces = base_mesh.faces.copy()
+
+    snapping_region_faces = set()
+    for face in new_mesh.faces:
+        face_is_in_snapping_region = True
+        for vertex in face:
+            if vertex not in extended_snapping_region:
+                face_is_in_snapping_region = False
+                break
+            if face_is_in_snapping_region:
+                snapping_region_faces.add(Triangle(face))
+
+    extended_correspondences = extended_snapping_correspondences.copy()
+    for i, position in enumerate(extended_mesh.positions):
+        # if i in extended_correspondences:
+        if i in extended_snapping_region:
+            continue
+        new_index = len(new_mesh.positions)
+        extended_correspondences[i] = new_index
+        new_mesh.positions.append(position)
+
+    for face in extended_mesh.faces:
+        # face_is_in_snapping_region = True
+        # for vertex in face:
+        #     if vertex not in extended_snapping_region:
+        #         face_is_in_snapping_region = False
+        #         break
+        # # don't copy faces that are completely in the snapping region
+        # if face_is_in_snapping_region:
+        #     continue
+        new_face = [extended_correspondences[vertex] for vertex in face]
+        if Triangle(new_face) in snapping_region_faces:
+            continue
+        new_mesh.faces.append(new_face)
+
+    return new_mesh
+
+def save_mesh(mesh, filename, np_array=True):
+    if np_array:
+        lists = [tuple(i) for i in mesh.positions.tolist()]
+    else:
+        lists = [tuple(i) for i in mesh.positions]
     # positions_element = PlyElement.describe(, "vertex")
     positions_element = PlyElement.describe(np.array(lists, dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")]), "vertex")
 
@@ -420,28 +401,21 @@ def main():
     parser.add_argument("output", type=str)
     parser.add_argument("iterations", type=int)
     parser.add_argument("--elasticity", type=int, default=1)
+    parser.add_argument("--smoothing", type=float, default=1)
     # TODO offset?
     args = parser.parse_args()
 
     mesh1 = Mesh(PlyData.read(args.mesh1))
     mesh2 = Mesh(PlyData.read(args.mesh2))
-    merge(mesh1, mesh2, args.iterations, args.elasticity)
-    #
-    import pickle
-    # with open('mesh1.pickle', 'wb') as f:
-    #     pickle.dump(mesh1, f)
-    # with open('mesh2.pickle', 'wb') as f:
-    #     pickle.dump(mesh2, f)
-    # with open('mesh1.pickle', 'rb') as f1,\
-    #     open('mesh2.pickle', 'rb') as f2:
-    #     mesh1 = pickle.load(f1)
-    #     mesh2 = pickle.load(f2)
+    output = merge(mesh1, mesh2, args.iterations, args.elasticity, args.smoothing)
 
     # IPython.embed()
 
     save_mesh(mesh1, "output1.ply")
     save_mesh(mesh2, "output2.ply")
+    save_mesh(output, args.output, np_array=False)
     (trimesh.load("output1.ply") + trimesh.load("output2.ply")).show()
+    trimesh.load(args.output).show()
 
 
 if __name__ == "__main__":

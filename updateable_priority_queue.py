@@ -45,6 +45,9 @@ class UpdateablePriorityQueue():
         priority, key = self._heap[0]
         return key, priority
 
+    def remove(self, key):
+        del self._dict[key]
+
     def __contains__(self, key):
         return key in self._dict
 
